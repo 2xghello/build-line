@@ -23,11 +23,28 @@
 --
 -- ============================================================================
 
+-- First, check if admin already exists
+-- Run this SELECT first to see current state:
+-- SELECT * FROM profiles WHERE user_code LIKE 'ADM%';
+
 -- Temporarily disable the audit trigger to avoid errors during first insert
 ALTER TABLE profiles DISABLE TRIGGER audit_profiles;
 
--- Insert the first admin profile
--- IMPORTANT: Replace the UUID below with the actual auth.users UUID!
+-- OPTION A: If ADM001 exists but has wrong auth_id, UPDATE it:
+UPDATE profiles
+SET auth_id = '321fbd12-323e-46dc-bae9-5f78169a264c',
+    full_name = 'Arsalan Ahmed',
+    email = 'arsalan@bch.com'
+WHERE user_code = 'ADM001';
+
+-- OPTION B: If you need a NEW admin (ADM002), uncomment below and comment out OPTION A:
+/*
+INSERT INTO user_code_sequences (prefix, current_value)
+VALUES ('ADM', 2)
+ON CONFLICT (prefix) DO UPDATE
+SET current_value = 2,
+    updated_at = NOW();
+
 INSERT INTO profiles (
     auth_id,
     user_code,
@@ -38,14 +55,15 @@ INSERT INTO profiles (
     created_by
 )
 VALUES (
-    '00000000-0000-0000-0000-000000000000',  -- << REPLACE THIS with actual auth user UUID
-    (SELECT generate_user_code('admin')),
-    'System Administrator',                   -- << Change this to actual name
-    'admin@example.com',                      -- << Change this to actual email
+    '321fbd12-323e-46dc-bae9-5f78169a264c',
+    'ADM002',
+    'Arsalan Ahmed',
+    'arsalan@bch.com',
     (SELECT id FROM roles WHERE name = 'admin'),
     'active',
-    NULL  -- First admin has no creator
+    NULL
 );
+*/
 
 -- Re-enable the audit trigger
 ALTER TABLE profiles ENABLE TRIGGER audit_profiles;

@@ -378,14 +378,15 @@ export async function updateCycleStatus(cycleId, status) {
 /**
  * Assign cycle to technician
  */
-export async function assignCycle(cycleId, technicianId, supervisorId) {
+export async function assignCycle(cycleId, technicianId, supervisorId, dueDate = null) {
   const { data, error } = await supabase
     .from('assignments')
     .insert({
       cycle_id: cycleId,
       technician_id: technicianId,
       supervisor_id: supervisorId,
-      assigned_at: new Date().toISOString()
+      assigned_at: new Date().toISOString(),
+      due_date: dueDate
     })
     .select()
     .single();
@@ -820,5 +821,585 @@ export async function getDashboardStats() {
     totalCycles: cycles.count || 0,
     pendingQC: pendingQC.count || 0,
     cyclesByStatus
+  };
+}
+
+// ----------------------------------------------------------------------------
+// TECHNICIAN - CHECKLIST FEATURES
+// ----------------------------------------------------------------------------
+
+/**
+ * Get checklist for an assignment/cycle
+ */
+export async function getAssignmentChecklist(cycleId) {
+  const { data, error } = await supabase
+    .from('checklists')
+    .select(`
+      id,
+      type,
+      status,
+      started_at,
+      completed_at,
+      notes,
+      checklist_items (
+        id,
+        item_order,
+        item_name,
+        description,
+        is_completed,
+        is_required,
+        completed_at,
+        notes,
+        photo_url,
+        profiles:completed_by (
+          full_name,
+          user_code
+        )
+      )
+    `)
+    .eq('cycle_id', cycleId)
+    .eq('type', 'technician_assembly')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .single();
+
+  if (error && error.code !== 'PGRST116') throw error; // PGRST116 = no rows
+  return data;
+}
+
+/**
+ * Create checklist for a cycle from template
+ */
+export async function createChecklistForCycle(cycleId, templateId, assignedTo) {
+  const { data: { user } } = await supabase.auth.getUser();
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('auth_id', user.id)
+    .single();
+
+  // Get template with items
+  const { data: template, error: templateError } = await supabase
+    .from('checklist_templates')
+    .select(`
+      id,
+      type,
+      checklist_template_items (
+        item_order,
+        item_name,
+        description,
+        is_required
+      )
+    `)
+    .eq('id', templateId)
+    .single();
+
+  if (templateError) throw templateError;
+
+  // Create checklist
+  const { data: checklist, error: checklistError } = await supabase
+    .from('checklists')
+    .insert({
+      cycle_id: cycleId,
+      type: template.type,
+      template_id: templateId,
+      created_by: profile.id,
+      assigned_to: assignedTo,
+      status: 'pending'
+    })
+    .select()
+    .single();
+
+  if (checklistError) throw checklistError;
+
+  // Create checklist items from template
+  if (template.checklist_template_items?.length > 0) {
+    const items = template.checklist_template_items.map(item => ({
+      checklist_id: checklist.id,
+      item_order: item.item_order,
+      item_name: item.item_name,
+      description: item.description,
+      is_required: item.is_required,
+      is_completed: false
+    }));
+
+    const { error: itemsError } = await supabase
+      .from('checklist_items')
+      .insert(items);
+
+    if (itemsError) throw itemsError;
+  }
+
+  return checklist;
+}
+
+/**
+ * Update checklist item with photo URL
+ */
+export async function updateChecklistItemPhoto(itemId, photoUrl) {
+  const { data, error } = await supabase
+    .from('checklist_items')
+    .update({ photo_url: photoUrl })
+    .eq('id', itemId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Start checklist (mark as in_progress)
+ */
+export async function startChecklist(checklistId) {
+  const { data, error } = await supabase
+    .from('checklists')
+    .update({
+      status: 'in_progress',
+      started_at: new Date().toISOString()
+    })
+    .eq('id', checklistId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Complete checklist
+ */
+export async function completeChecklist(checklistId) {
+  const { data, error } = await supabase
+    .from('checklists')
+    .update({
+      status: 'completed',
+      completed_at: new Date().toISOString()
+    })
+    .eq('id', checklistId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Get technician's assignment history
+ */
+export async function getAssignmentHistory(technicianId, limit = 50) {
+  const { data, error } = await supabase
+    .from('assignments')
+    .select(`
+      id,
+      assigned_at,
+      started_at,
+      completed_at,
+      status,
+      cycles (
+        id,
+        serial_number,
+        model,
+        status
+      )
+    `)
+    .eq('technician_id', technicianId)
+    .eq('status', 'completed')
+    .order('completed_at', { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data;
+}
+
+// ----------------------------------------------------------------------------
+// QC - STATS AND HISTORY
+// ----------------------------------------------------------------------------
+
+/**
+ * Get QC stats for today (passed/failed counts)
+ */
+export async function getQCStats(inspectorId = null) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  let query = supabase
+    .from('qc_logs')
+    .select('id, result')
+    .gte('inspected_at', today.toISOString());
+
+  if (inspectorId) {
+    query = query.eq('inspector_id', inspectorId);
+  }
+
+  const { data, error } = await query;
+
+  if (error) throw error;
+
+  return {
+    passed: data?.filter(q => q.result === 'passed').length || 0,
+    failed: data?.filter(q => q.result === 'failed').length || 0,
+    total: data?.length || 0
+  };
+}
+
+/**
+ * Get cycle's checklist for QC review
+ */
+export async function getCycleChecklist(cycleId) {
+  const { data, error } = await supabase
+    .from('checklists')
+    .select(`
+      id,
+      type,
+      status,
+      started_at,
+      completed_at,
+      notes,
+      profiles:assigned_to (
+        full_name,
+        user_code
+      ),
+      checklist_items (
+        id,
+        item_order,
+        item_name,
+        description,
+        is_completed,
+        is_required,
+        completed_at,
+        notes,
+        photo_url
+      )
+    `)
+    .eq('cycle_id', cycleId)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Get QC history for an inspector
+ */
+export async function getQCHistory(inspectorId = null, limit = 50) {
+  let query = supabase
+    .from('qc_logs')
+    .select(`
+      id,
+      result,
+      overall_score,
+      defects_found,
+      notes,
+      is_override,
+      inspected_at,
+      cycles (
+        id,
+        serial_number,
+        model,
+        status
+      ),
+      profiles:inspector_id (
+        full_name,
+        user_code
+      )
+    `)
+    .order('inspected_at', { ascending: false })
+    .limit(limit);
+
+  if (inspectorId) {
+    query = query.eq('inspector_id', inspectorId);
+  }
+
+  const { data, error } = await query;
+
+  if (error) throw error;
+  return data;
+}
+
+// ----------------------------------------------------------------------------
+// SUPERVISOR - REASSIGN AND DUE DATES
+// ----------------------------------------------------------------------------
+
+/**
+ * Reassign cycle to a different technician
+ */
+export async function reassignCycle(assignmentId, newTechnicianId, reason = null) {
+  const { data: { user } } = await supabase.auth.getUser();
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('auth_id', user.id)
+    .single();
+
+  // Get current assignment
+  const { data: currentAssignment, error: fetchError } = await supabase
+    .from('assignments')
+    .select('cycle_id, technician_id')
+    .eq('id', assignmentId)
+    .single();
+
+  if (fetchError) throw fetchError;
+
+  // Update existing assignment to reassigned status
+  const { error: updateError } = await supabase
+    .from('assignments')
+    .update({
+      status: 'reassigned',
+      notes: reason ? `Reassigned: ${reason}` : 'Reassigned to another technician'
+    })
+    .eq('id', assignmentId);
+
+  if (updateError) throw updateError;
+
+  // Create new assignment for the new technician
+  const { data: newAssignment, error: insertError } = await supabase
+    .from('assignments')
+    .insert({
+      cycle_id: currentAssignment.cycle_id,
+      technician_id: newTechnicianId,
+      supervisor_id: profile.id,
+      assigned_at: new Date().toISOString(),
+      status: 'pending',
+      notes: reason ? `Reassigned from previous technician: ${reason}` : null
+    })
+    .select()
+    .single();
+
+  if (insertError) throw insertError;
+
+  // Update cycle status back to assigned
+  await updateCycleStatus(currentAssignment.cycle_id, 'assigned');
+
+  // Log to audit
+  await logAudit({
+    action: 'UPDATE',
+    tableName: 'assignments',
+    recordId: assignmentId,
+    details: {
+      action: 'reassign',
+      old_technician: currentAssignment.technician_id,
+      new_technician: newTechnicianId,
+      reason
+    }
+  });
+
+  return newAssignment;
+}
+
+/**
+ * Update assignment due date
+ */
+export async function updateDueDate(assignmentId, dueDate) {
+  const { data, error } = await supabase
+    .from('assignments')
+    .update({ due_date: dueDate })
+    .eq('id', assignmentId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Get team performance metrics for supervisor
+ */
+export async function getTeamPerformance(supervisorId = null, days = 30) {
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - days);
+
+  let query = supabase
+    .from('assignments')
+    .select(`
+      id,
+      technician_id,
+      assigned_at,
+      started_at,
+      completed_at,
+      status,
+      profiles:technician_id (
+        full_name,
+        user_code
+      )
+    `)
+    .gte('assigned_at', startDate.toISOString());
+
+  if (supervisorId) {
+    query = query.eq('supervisor_id', supervisorId);
+  }
+
+  const { data, error } = await query;
+
+  if (error) throw error;
+
+  // Calculate metrics per technician
+  const technicianStats = {};
+  data?.forEach(assignment => {
+    const techId = assignment.technician_id;
+    if (!technicianStats[techId]) {
+      technicianStats[techId] = {
+        technician: assignment.profiles,
+        total: 0,
+        completed: 0,
+        inProgress: 0,
+        pending: 0,
+        avgCompletionTime: []
+      };
+    }
+
+    technicianStats[techId].total++;
+
+    if (assignment.status === 'completed') {
+      technicianStats[techId].completed++;
+      if (assignment.started_at && assignment.completed_at) {
+        const startTime = new Date(assignment.started_at);
+        const endTime = new Date(assignment.completed_at);
+        const hours = (endTime - startTime) / (1000 * 60 * 60);
+        technicianStats[techId].avgCompletionTime.push(hours);
+      }
+    } else if (assignment.status === 'in_progress') {
+      technicianStats[techId].inProgress++;
+    } else if (assignment.status === 'pending') {
+      technicianStats[techId].pending++;
+    }
+  });
+
+  // Calculate average completion time
+  Object.values(technicianStats).forEach(stat => {
+    if (stat.avgCompletionTime.length > 0) {
+      const avg = stat.avgCompletionTime.reduce((a, b) => a + b, 0) / stat.avgCompletionTime.length;
+      stat.avgCompletionTimeHours = Math.round(avg * 10) / 10;
+    } else {
+      stat.avgCompletionTimeHours = null;
+    }
+    delete stat.avgCompletionTime;
+  });
+
+  return Object.values(technicianStats);
+}
+
+// ----------------------------------------------------------------------------
+// SALES - QC REPORTS AND DISPATCH HISTORY
+// ----------------------------------------------------------------------------
+
+/**
+ * Get full QC report for a cycle
+ */
+export async function getQCReport(cycleId) {
+  const { data, error } = await supabase
+    .from('qc_logs')
+    .select(`
+      id,
+      result,
+      overall_score,
+      defects_found,
+      notes,
+      photos,
+      is_override,
+      inspected_at,
+      profiles:inspector_id (
+        id,
+        full_name,
+        user_code
+      )
+    `)
+    .eq('cycle_id', cycleId)
+    .order('inspected_at', { ascending: false });
+
+  if (error) throw error;
+
+  // Also get the cycle details
+  const { data: cycle, error: cycleError } = await supabase
+    .from('cycles')
+    .select(`
+      id,
+      serial_number,
+      model,
+      variant,
+      color,
+      status,
+      priority,
+      created_at,
+      assignments (
+        id,
+        assigned_at,
+        completed_at,
+        profiles:technician_id (
+          full_name,
+          user_code
+        )
+      )
+    `)
+    .eq('id', cycleId)
+    .single();
+
+  if (cycleError) throw cycleError;
+
+  return {
+    cycle,
+    qcLogs: data
+  };
+}
+
+/**
+ * Get dispatch history
+ */
+export async function getDispatchHistory(limit = 50) {
+  const { data, error } = await supabase
+    .from('cycles')
+    .select(`
+      id,
+      serial_number,
+      model,
+      variant,
+      color,
+      status,
+      notes,
+      updated_at,
+      qc_logs (
+        id,
+        result,
+        overall_score,
+        inspected_at,
+        profiles:inspector_id (
+          full_name,
+          user_code
+        )
+      )
+    `)
+    .eq('status', 'dispatched')
+    .order('updated_at', { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Get dispatch stats
+ */
+export async function getDispatchStats(days = 7) {
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - days);
+
+  const { data, error } = await supabase
+    .from('cycles')
+    .select('id, updated_at')
+    .eq('status', 'dispatched')
+    .gte('updated_at', startDate.toISOString());
+
+  if (error) throw error;
+
+  // Group by day
+  const byDay = {};
+  data?.forEach(cycle => {
+    const day = new Date(cycle.updated_at).toLocaleDateString();
+    byDay[day] = (byDay[day] || 0) + 1;
+  });
+
+  return {
+    total: data?.length || 0,
+    byDay
   };
 }
