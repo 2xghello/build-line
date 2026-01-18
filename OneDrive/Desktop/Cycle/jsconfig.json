@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@app/*": ["src/app/*"],
+      "@components/*": ["src/app/components/*"],
+      "@context/*": ["src/app/context/*"],
+      "@services/*": ["src/app/services/*"],
+      "@routes/*": ["src/app/routes/*"],
+      "@dashboards/*": ["src/app/dashboards/*"],
+      "@auth/*": ["src/app/auth/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
+}
